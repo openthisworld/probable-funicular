@@ -1,62 +1,136 @@
-resource "aws_eks_cluster" "example" {
-  name     = "example-cluster"
-  role_arn = aws_iam_role.eks.arn
-
-  vpc_config {
-    subnet_ids = [aws_subnet.example_subnet1.id, aws_subnet.example_subnet2.id]
-    security_group_ids = [aws_security_group.example_sg.id]
-  }
-
+provider "aws" {
+  region = "us-west-2"
 }
 
-resource "aws_iam_role" "eks" {
-  name = "example-eks"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "eks.amazonaws.com"
-        }
-      },
-    ]
-  })
+# Data source for available AZs
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
-resource "kubernetes_deployment" "example" {
-  metadata {
-    name = "example-deployment"
+# VPC
+resource "aws_vpc" "eks_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "eks_vpc"
+  }
+}
+
+# Internet Gateway
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.eks_vpc.id
+
+  tags = {
+    Name = "eks_igw"
+  }
+}
+
+# Public Subnets
+resource "aws_subnet" "public_subnet" {
+  count                   = length(data.aws_availability_zones.available.names)
+  vpc_id                  = aws_vpc.eks_vpc.id
+  cidr_block              = "10.0.${count.index}.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "public_subnet-${count.index}"
+  }
+}
+
+# Elastic IPs for the NAT Gateways
+resource "aws_eip" "nat_eip" {
+  count  = length(data.aws_availability_zones.available.names)
+  domain = "vpc"
+
+  tags = {
+    Name = "nat_eip-${count.index}"
+  }
+}
+
+# NAT Gateways
+resource "aws_nat_gateway" "nat_gw" {
+  count         = length(data.aws_availability_zones.available.names)
+  subnet_id     = element(aws_subnet.public_subnet.*.id, count.index)
+  allocation_id = aws_eip.nat_eip[count.index].id
+
+  tags = {
+    Name = "nat_gw-${count.index}"
+  }
+}
+
+# Private Subnets
+resource "aws_subnet" "private_subnet" {
+  count             = length(data.aws_availability_zones.available.names)
+  vpc_id            = aws_vpc.eks_vpc.id
+  cidr_block        = "10.0.${count.index + length(data.aws_availability_zones.available.names)}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "private_subnet-${count.index}"
+  }
+}
+
+# Public Route Table
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.eks_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
   }
 
-  spec {
-    replicas = 2
+  tags = {
+    Name = "public_rt"
+  }
+}
 
-    selector {
-      match_labels = {
-        App = "example-app"
-      }
-    }
+# Public Route Table Associations
+resource "aws_route_table_association" "public_rta" {
+  count          = length(aws_subnet.public_subnet.*.id)
+  subnet_id      = aws_subnet.public_subnet[count.index].id
+  route_table_id = aws_route_table.public_rt.id
+}
 
-    template {
-      metadata {
-        labels = {
-          App = "example-app"
-        }
-      }
+# Private Route Table
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.eks_vpc.id
 
-      spec {
-        container {
-          image = "openthisworld/probable-funicular:latest"
-          name  = "example"
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat_gw[0].id  # Предполагаем, что у вас один NAT Gateway
+  }
 
-          port {
-            container_port = 80
-          }
-        }
-      }
+  tags = {
+    Name = "private_rt"
+  }
+}
+
+
+# Private Route Table Associations
+resource "aws_route_table_association" "private_rta" {
+  count          = length(aws_subnet.private_subnet.*.id)
+  subnet_id      = aws_subnet.private_subnet[count.index].id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+# EKS Cluster
+module "eks" {
+  source          = "terraform-aws-modules/eks/aws"
+  cluster_name    = "my-eks-cluster"
+  cluster_version = "1.29"
+  subnets         = aws_subnet.private_subnet.*.id
+
+  vpc_id = aws_vpc.eks_vpc.id
+
+  node_groups = {
+    example = {
+      desired_capacity = 2
+      max_capacity     = 3
+      min_capacity     = 1
+      instance_type    = "m5.large"
     }
   }
 }
